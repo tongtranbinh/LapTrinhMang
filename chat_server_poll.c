@@ -34,6 +34,24 @@ void broadcast(int sender, const char *msg, int nfds, struct pollfd *fds) {
     }
 }
 
+void encode(const char *input, char *output, size_t out_size) {
+    size_t j = 0;
+    for (size_t i = 0; input[i] != '\0' && j < out_size - 1; i++) {
+        char c = input[i];
+
+        if (c >= 'A' && c <= 'Z') {
+            c = (c == 'Z') ? 'A' : (char)(c + 1);
+        } else if (c >= 'a' && c <= 'z') {
+            c = (c == 'z') ? 'a' : (char)(c + 1);
+        } else if (c >= '0' && c <= '9') {
+            c = (char)('9' - (c - '0'));
+        }
+
+        output[j++] = c;
+    }
+    output[j] = '\0';
+}
+
 int main() {
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
@@ -155,7 +173,10 @@ int main() {
                 snprintf(msg + prefix_len, remain, "%.*s",
                          remain - 1, buf);
 
-                broadcast(fds[i].fd, msg, nfds, fds);
+                char encoded_msg[BUF_SIZE];
+                encode(msg, encoded_msg, sizeof(encoded_msg));
+
+                broadcast(fds[i].fd, encoded_msg, nfds, fds);
             }
         }
     }

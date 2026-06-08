@@ -2,10 +2,11 @@
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -19,12 +20,67 @@ typedef struct {
     char client_name[64];
 } Client;
 
+static Client g_clients[MAX_CLIENTS];
+static pthread_mutex_t g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void trim_newline(char *s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
         s[n - 1] = '\0';
         n--;
     }
+}
+
+static ssize_t send_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, p + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return (ssize_t)sent;
+}
+
+static ssize_t recv_line(int fd, char *buf, size_t cap) {
+    if (cap == 0) {
+        return -1;
+    }
+
+    size_t i = 0;
+    while (i + 1 < cap) {
+        char c;
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n == 0) {
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+
+        if (c == '\n') {
+            break;
+        }
+        if (c == '\r') {
+            continue;
+        }
+        buf[i++] = c;
+    }
+
+    buf[i] = '\0';
+    trim_newline(buf);
+    return (ssize_t)i;
 }
 
 static int is_single_token(const char *s) {
@@ -55,7 +111,6 @@ static int parse_login(const char *line, char *out_id, size_t out_id_sz,
     char id_buf[64];
     memcpy(id_buf, line, id_len);
     id_buf[id_len] = '\0';
-
     while (id_len > 0 && isspace((unsigned char)id_buf[id_len - 1])) {
         id_buf[id_len - 1] = '\0';
         id_len--;
@@ -92,12 +147,153 @@ static int parse_login(const char *line, char *out_id, size_t out_id_sz,
     return 1;
 }
 
-static void broadcast_message(Client clients[], int sender_fd, const char *msg) {
+static void broadcast_message(int sender_fd, const char *msg) {
+    pthread_mutex_lock(&g_clients_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd > 0 && clients[i].fd != sender_fd && clients[i].is_logged_in) {
-            send(clients[i].fd, msg, strlen(msg), 0);
+        if (g_clients[i].fd > 0 && g_clients[i].fd != sender_fd && g_clients[i].is_logged_in) {
+            (void)send_all(g_clients[i].fd, msg, strlen(msg));
         }
     }
+    pthread_mutex_unlock(&g_clients_lock);
+}
+
+static void remove_client_fd(int fd) {
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].fd == fd) {
+            g_clients[i].fd = 0;
+            g_clients[i].is_logged_in = 0;
+            g_clients[i].client_id[0] = '\0';
+            g_clients[i].client_name[0] = '\0';
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_clients_lock);
+}
+
+typedef struct {
+    int fd;
+} ClientThreadArg;
+
+static void *client_thread(void *arg) {
+    ClientThreadArg *cta = (ClientThreadArg *)arg;
+    int fd = cta->fd;
+    free(cta);
+    pthread_detach(pthread_self());
+
+    const char *welcome =
+        "Welcome. Login with: client_id: client_name\n"
+        "Example: B21DCCN001: an\n";
+    (void)send_all(fd, welcome, strlen(welcome));
+
+    int logged_in = 0;
+    char client_id[64] = {0};
+    char client_name[64] = {0};
+
+    while (1) {
+        char line[BUF_SIZE + 1];
+        ssize_t n = recv_line(fd, line, sizeof(line));
+        if (n <= 0) {
+            break;
+        }
+
+        if (!logged_in) {
+            char parsed_id[64];
+            char parsed_name[64];
+            if (!parse_login(line, parsed_id, sizeof(parsed_id), parsed_name, sizeof(parsed_name))) {
+                const char *invalid =
+                    "Invalid format. Use: client_id: client_name\n"
+                    "client_name must be one word.\n";
+                (void)send_all(fd, invalid, strlen(invalid));
+                continue;
+            }
+
+            snprintf(client_id, sizeof(client_id), "%s", parsed_id);
+            snprintf(client_name, sizeof(client_name), "%s", parsed_name);
+            logged_in = 1;
+
+            pthread_mutex_lock(&g_clients_lock);
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (g_clients[i].fd == fd) {
+                    g_clients[i].is_logged_in = 1;
+                    snprintf(g_clients[i].client_id, sizeof(g_clients[i].client_id), "%s", client_id);
+                    snprintf(g_clients[i].client_name, sizeof(g_clients[i].client_name), "%s", client_name);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_clients_lock);
+
+            char ok_msg[256];
+            snprintf(ok_msg, sizeof(ok_msg),
+                     "Login ok. Hello %s (%s). Type /quit to leave.\n",
+                     client_name, client_id);
+            (void)send_all(fd, ok_msg, strlen(ok_msg));
+
+            char join_msg[256];
+            snprintf(join_msg, sizeof(join_msg), "[Server] %s (%s) joined chat\n",
+                     client_name, client_id);
+            printf("%s", join_msg);
+            broadcast_message(fd, join_msg);
+            continue;
+        }
+
+        if (strcmp(line, "/quit") == 0) {
+            const char *bye = "Bye.\n";
+            (void)send_all(fd, bye, strlen(bye));
+            break;
+        }
+
+        char out[BUF_SIZE + 256];
+        snprintf(out, sizeof(out), "[%s|%s] %s\n", client_id, client_name, line);
+        printf("%s", out);
+        broadcast_message(fd, out);
+    }
+
+    if (logged_in) {
+        char leave_msg[256];
+        snprintf(leave_msg, sizeof(leave_msg), "[Server] %s (%s) left chat\n", client_name, client_id);
+        printf("%s", leave_msg);
+        broadcast_message(fd, leave_msg);
+    }
+
+    remove_client_fd(fd);
+    close(fd);
+    return NULL;
+}
+
+static int create_server_socket(int port) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(server_fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        return -1;
+    }
+
+    if (listen(server_fd, 64) < 0) {
+        perror("listen");
+        close(server_fd);
+        return -1;
+    }
+
+    return server_fd;
 }
 
 int main(int argc, char *argv[]) {
@@ -112,192 +308,65 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    signal(SIGPIPE, SIG_IGN);
+    memset(g_clients, 0, sizeof(g_clients));
+
+    int server_fd = create_server_socket(port);
     if (server_fd < 0) {
-        perror("socket");
         return 1;
     }
 
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        close(server_fd);
-        return 1;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((uint16_t)port);
-
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        return 1;
-    }
-
-    if (listen(server_fd, 10) < 0) {
-        perror("listen");
-        close(server_fd);
-        return 1;
-    }
-
-    Client clients[MAX_CLIENTS];
-    memset(clients, 0, sizeof(clients));
-
-    printf("Chat server listening on port %d...\n", port);
+    printf("Chat server (multithread) listening on port %d...\n", port);
 
     while (1) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(server_fd, &readfds);
-
-        int max_fd = server_fd;
-
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            int fd = clients[i].fd;
-            if (fd > 0) {
-                FD_SET(fd, &readfds);
-                if (fd > max_fd) {
-                    max_fd = fd;
-                }
-            }
-        }
-
-        int ready = select(max_fd + 1, &readfds, NULL, NULL, NULL);
-        if (ready < 0) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("select");
-            break;
+            perror("accept");
+            continue;
         }
 
-        if (FD_ISSET(server_fd, &readfds)) {
-            struct sockaddr_in caddr;
-            socklen_t clen = sizeof(caddr);
-            int client_fd = accept(server_fd, (struct sockaddr *)&caddr, &clen);
-            if (client_fd < 0) {
-                perror("accept");
-            } else {
-                int added = 0;
-                for (int i = 0; i < MAX_CLIENTS; i++) {
-                    if (clients[i].fd == 0) {
-                        clients[i].fd = client_fd;
-                        clients[i].is_logged_in = 0;
-                        clients[i].client_id[0] = '\0';
-                        clients[i].client_name[0] = '\0';
-                        added = 1;
-                        break;
-                    }
-                }
-
-                if (!added) {
-                    const char *full = "Server full. Try again later.\n";
-                    send(client_fd, full, strlen(full), 0);
-                    close(client_fd);
-                } else {
-                    const char *welcome =
-                        "Welcome. Login with: client_id: client_name\n"
-                        "Example: B21DCCN001: an\n";
-                    send(client_fd, welcome, strlen(welcome), 0);
-                }
-            }
-        }
-
+        int added = 0;
+        pthread_mutex_lock(&g_clients_lock);
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            int fd = clients[i].fd;
-            if (fd <= 0 || !FD_ISSET(fd, &readfds)) {
-                continue;
+            if (g_clients[i].fd == 0) {
+                g_clients[i].fd = client_fd;
+                g_clients[i].is_logged_in = 0;
+                g_clients[i].client_id[0] = '\0';
+                g_clients[i].client_name[0] = '\0';
+                added = 1;
+                break;
             }
+        }
+        pthread_mutex_unlock(&g_clients_lock);
 
-            char buf[BUF_SIZE + 1];
-            int n = recv(fd, buf, BUF_SIZE, 0);
-            if (n <= 0) {
-                struct sockaddr_in peer;
-                socklen_t plen = sizeof(peer);
-                char leave_msg[256] = "[Server] A client left chat\n";
-                if (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0) {
-                    snprintf(leave_msg, sizeof(leave_msg), "[Server] %s:%d left chat\n",
-                             inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
-                }
-                printf("%s", leave_msg);
-                if (clients[i].is_logged_in) {
-                    broadcast_message(clients, fd, leave_msg);
-                }
-                close(fd);
-                clients[i].fd = 0;
-                clients[i].is_logged_in = 0;
-                clients[i].client_id[0] = '\0';
-                clients[i].client_name[0] = '\0';
-                continue;
-            }
+        if (!added) {
+            const char *full = "Server full. Try again later.\n";
+            (void)send_all(client_fd, full, strlen(full));
+            close(client_fd);
+            continue;
+        }
 
-            buf[n] = '\0';
-            trim_newline(buf);
+        ClientThreadArg *cta = (ClientThreadArg *)malloc(sizeof(*cta));
+        if (!cta) {
+            const char *busy = "Server busy. Try again later.\n";
+            (void)send_all(client_fd, busy, strlen(busy));
+            remove_client_fd(client_fd);
+            close(client_fd);
+            continue;
+        }
+        cta->fd = client_fd;
 
-            if (!clients[i].is_logged_in) {
-                char parsed_id[64];
-                char parsed_name[64];
-                if (!parse_login(buf, parsed_id, sizeof(parsed_id), parsed_name,
-                                 sizeof(parsed_name))) {
-                    const char *invalid =
-                        "Invalid format. Use: client_id: client_name\n"
-                        "client_name must be one word.\n";
-                    send(fd, invalid, strlen(invalid), 0);
-                    continue;
-                }
-
-                clients[i].is_logged_in = 1;
-                snprintf(clients[i].client_id, sizeof(clients[i].client_id), "%s", parsed_id);
-                snprintf(clients[i].client_name, sizeof(clients[i].client_name), "%s", parsed_name);
-
-                char ok_msg[256];
-                snprintf(ok_msg, sizeof(ok_msg),
-                         "Login ok. Hello %s (%s). Type /quit to leave.\n",
-                         clients[i].client_name, clients[i].client_id);
-                send(fd, ok_msg, strlen(ok_msg), 0);
-
-                char join_msg[256];
-                snprintf(join_msg, sizeof(join_msg), "[Server] %s (%s) joined chat\n",
-                         clients[i].client_name, clients[i].client_id);
-                printf("%s", join_msg);
-                broadcast_message(clients, fd, join_msg);
-                continue;
-            }
-
-            if (strcmp(buf, "/quit") == 0) {
-                const char *bye = "Bye.\n";
-                send(fd, bye, strlen(bye), 0);
-                close(fd);
-                char leave_msg[256];
-                snprintf(leave_msg, sizeof(leave_msg), "[Server] %s (%s) left chat\n",
-                         clients[i].client_name, clients[i].client_id);
-                printf("%s", leave_msg);
-                broadcast_message(clients, fd, leave_msg);
-
-                clients[i].fd = 0;
-                clients[i].is_logged_in = 0;
-                clients[i].client_id[0] = '\0';
-                clients[i].client_name[0] = '\0';
-                continue;
-            }
-
-            char out[BUF_SIZE + 256];
-            snprintf(out, sizeof(out), "[%s|%s] %s\n", clients[i].client_id,
-                     clients[i].client_name, buf);
-
-            printf("%s", out);
-            broadcast_message(clients, fd, out);
+        pthread_t th;
+        if (pthread_create(&th, NULL, client_thread, cta) != 0) {
+            const char *busy = "Server busy. Try again later.\n";
+            (void)send_all(client_fd, busy, strlen(busy));
+            free(cta);
+            remove_client_fd(client_fd);
+            close(client_fd);
+            continue;
         }
     }
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd > 0) {
-            close(clients[i].fd);
-        }
-    }
-    close(server_fd);
-    return 0;
 }
